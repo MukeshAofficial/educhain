@@ -25,10 +25,29 @@ import base64
 import os
 from PIL import Image
 import io
-
-# Update the QuestionType definition
-
+import google.generativeai as genai
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+import numpy as np
+import io
+from PIL import Image
+import requests
+from IPython.display import display, Image as DisplayImage, HTML
+import json
+import pandas as pd
 import random
+from langchain.prompts import PromptTemplate
+from langchain_google_genai import ChatGoogleGenerativeAI
+import educhain
+from typing import Optional, Type, Any, List, Literal, Union, Tuple
+from pydantic import BaseModel, Field, field_validator
+from langchain.output_parsers import PydanticOutputParser
+import random
+from google.colab import userdata
+import logging
+from io import BytesIO
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 QuestionType = Literal["Multiple Choice", "Short Answer", "True/False", "Fill in the Blank"]
 OutputFormatType = Literal["pdf", "csv"]
@@ -45,6 +64,23 @@ class QnAEngine:
     def _initialize_llm(self, llm_config: LLMConfig):
         if llm_config.custom_model:
             return llm_config.custom_model
+        elif llm_config.model_name.startswith('gemini'):
+             try:
+                gemini_api_key = llm_config.api_key #userdata.get("GOOGLE_API_KEY")
+             except (FileNotFoundError, json.JSONDecodeError):
+                print("Error: Could not load API key from 'userdata.json'. Please ensure the file exists and is valid JSON.")
+                exit()
+
+             if not gemini_api_key:
+                print("Error: Google API key not found in 'userdata.json'.")
+                exit()
+             return ChatGoogleGenerativeAI(
+                model=llm_config.model_name,
+                google_api_key=gemini_api_key,
+                temperature=llm_config.temperature,
+                max_output_tokens=llm_config.max_tokens
+            )
+
         else:
             return ChatOpenAI(
                 model=llm_config.model_name,
@@ -435,7 +471,7 @@ class QnAEngine:
 
     def _extract_video_id(self, url: str) -> str:
         """Extract YouTube video ID from URL."""
-        pattern = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?(?:embed\/)?(?:v\/)?(?:shorts\/)?(?:live\/)?(?:feature=player_embedded&v=)?(?:e\/)?(?:\/)?([^\s&amp;?#]+)'
+        pattern = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?(?:embed\/)?(?:v\/)?(?:shorts\/)?(?:live\/)?(?:feature=player_embedded&v=)?(?:e\/)?(?:\/)?([^\s&?#]+)'
         match = re.search(pattern, url)
         if match:
             return match.group(1)
@@ -661,5 +697,401 @@ class QnAEngine:
                 steps=[],
                 additional_notes="An error occurred during processing."
             )
+    def _format_question_and_options(self,question_data):
+        """Formats question and options for display."""
+        formatted_output = {
+            "formatted_question": question_data.question_text,
+            "formatted_options": [f"{chr(ord('a') + i)}. {option}" for i, option in enumerate(question_data.options)]
+        }
+        return formatted_output
+    
+    def _generate_graph(self,instruction):
+        """Generates a graph or table using matplotlib based on instruction."""
+        try:
+            plt.figure(figsize=(8, 6))
 
-   
+            if instruction["type"] == "bar":
+                plt.bar(instruction["x_labels"], instruction["y_values"])
+                plt.xlabel("Subjects")
+                plt.ylabel(instruction["y_label"])
+                plt.title(instruction["title"])
+                plt.grid(axis='y', linestyle='--')
+                plt.tight_layout()
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png')
+                buf.seek(0)
+                plt.close()
+                return buf
+
+            elif instruction["type"] == "line":
+                plt.plot(instruction["x_labels"], instruction["y_values"], marker='o')
+                plt.xlabel("X Values")
+                plt.ylabel(instruction["y_label"])
+                plt.title(instruction["title"])
+                plt.grid(axis='y', linestyle='--')
+                plt.tight_layout()
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png')
+                buf.seek(0)
+                plt.close()
+                return buf
+
+            elif instruction["type"] == "pie":
+                plt.pie(instruction["sizes"], labels=instruction["labels"], autopct='%1.1f%%', startangle=90)
+                plt.title(instruction["title"])
+                plt.tight_layout()
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png')
+                buf.seek(0)
+                plt.close()
+                return buf
+
+            elif instruction["type"] == "scatter":
+                plt.scatter(instruction["x_values"], instruction["y_values"])
+                plt.xlabel("X Values")
+                plt.ylabel(instruction["y_label"])
+                plt.title(instruction["title"])
+                plt.grid(axis='y', linestyle='--')
+                plt.tight_layout()
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png')
+                buf.seek(0)
+                plt.close()
+                return buf
+
+            elif instruction["type"] == "table":
+                df = pd.DataFrame(instruction['data'])
+                display(HTML(df.to_html(index=False)))
+                return None
+
+        except Exception as e:
+            print(f"Error generating graph or table: {e}")
+            return None
+
+    def generate_visual_qa(self, topic, num=1, chart_type: Optional[Literal["bar", "line", "pie", "scatter", "table"]] = None):
+        """Generates GMAT visual question with graph instructions using Educhain then displays the output."""
+        
+        if isinstance(self.llm, ChatGoogleGenerativeAI):
+            parser = PydanticOutputParser(pydantic_object=GMATQuestion)
+            format_instructions = parser.get_format_instructions()
+
+            prompt_template = """
+                Generate {num} GMAT style quantitative question from one of the following topics, based on the data provided to you (select a topic at random):
+                 *   Arithmetic (Fractions, Decimals, Percentages, Ratios, Averages) - use only one of 'pie', 'bar', or 'line' chart as visual, pie if using fractions, bar or line if using others
+                 *   Algebra (Linear Equations, Inequalities) - use line or number lines as visual
+                 *   Statistics and Probability (Mean, Median, Mode, Range, Standard Deviation) use only 'bar' or 'scatter' plot as visual
+                 *   Data Insights (Reading and Interpreting Bar Charts, Line Graphs, Scatter Plots, Tables, Sorting, Filtering, Identifying Trends) - use bar, line, scatter or table.
+
+                The question should require some kind of visual (bar graph, pie chart, line graph, scatter plot or table) representation of the data along with a detailed instruction on how to create that visual and also options for the question.
+
+                The graph/table instruction MUST have the following structure in json format (select the relevant keys based on the visual type you are selecting for the question):
+                {{
+                     "type": "{chart_type}",
+                     "x_labels": ["label 1", "label 2", "label 3", "label 4"] for bar or line graphs,
+                     "x_values": [value 1, value 2, value 3, value 4] for scatter plot,
+                     "y_values": [value 1, value 2, value 3, value 4] for bar or line graphs,
+                     "labels": ["label 1", "label 2", "label 3", "label 4"] for pie chart,
+                     "sizes": [value 1, value 2, value 3, value 4] for pie chart,
+                     "data": [{{ "column1": value, "column2": value }}, ... ] for table,
+                     "y_label": "label for the y axis" for bar, line, scatter plot,
+                     "title": "title of the graph or table"
+                }}
+
+                Output the response in json format with the following structure:
+                {{
+                    "question_text": "gmat style question",
+                    "options": ["option a","option b", "option c", "option d"],
+                    "graph_instruction": {{"type": "bar" or "pie" or "line" or "scatter" or "table", ...}},
+                    "correct_answer": "Correct answer of the question"
+                }}
+            """
+
+            prompt = PromptTemplate(
+                input_variables=["num", "topic", "chart_type"],
+                template=prompt_template,
+                partial_variables={"format_instructions": format_instructions}
+            )
+
+            chain = prompt | self.llm
+
+            results = chain.invoke({"num": num, "topic": topic, "chart_type": chart_type})
+            results = results.content
+            try:
+              questions = []
+              try:
+                question_list = GMATQuestionList.model_validate_json(results)
+                for question_data in question_list.questions:
+                    image_buffer = self._generate_graph(question_data.graph_instruction.dict())  # Generate Graph or Table
+                    if image_buffer:
+                        display(DisplayImage(data=image_buffer.getvalue(), format='png'))  # Display Graph
+                    formatted_output = self._format_question_and_options(question_data)
+                    print("\nQuestion:")
+                    print(formatted_output['formatted_question'])
+                    print("\nOptions:")
+                    for option in formatted_output['formatted_options']:
+                        print(option)
+                    print("\nCorrect Answer:", question_data.correct_answer)
+                    questions.append(question_data)
+              except:
+                question_data = parser.parse(results)
+                image_buffer = self._generate_graph(question_data.graph_instruction.dict()) #Generate Graph or Table
+                if image_buffer:
+                    display(DisplayImage(data=image_buffer.getvalue(), format='png')) #Display Graph
+                formatted_output = self._format_question_and_options(question_data)
+                print("\nQuestion:")
+                print(formatted_output['formatted_question'])
+                print("\nOptions:")
+                for option in formatted_output['formatted_options']:
+                    print(option)
+                print("\nCorrect Answer:", question_data.correct_answer)
+                questions.append(question_data)
+              return questions
+
+            except Exception as e:
+              print(f"Error parsing output: {e}")
+              print("Raw output:", results)
+              return None
+        else:
+            print ("Visual Question Generation is only supported for Gemini models")
+            return None
+    
+    def generate_visual_questions_new(self, topic, num=5):
+      """Generates visual based questions with graph instructions then displays the output."""
+      try:
+            # Load API Key from a local 'userdata.json' file or similar
+            try:
+                gemini_api_key = self.llm.google_api_key #userdata.get("GOOGLE_API_KEY")
+            except (FileNotFoundError, json.JSONDecodeError):
+               print("Error: Could not load API key from 'userdata.json'. Please ensure the file exists and is valid JSON.")
+               exit()
+
+            if not gemini_api_key:
+                print("Error: Google API key not found in 'userdata.json'.")
+                exit()
+
+
+            output_file = "questions_with_images.json"
+
+            all_questions = []
+            question_number = 1
+
+
+            # Generate questions in batches, since the limit is 10 for gemini
+            batch_size = 10
+            for i in range(0, num, batch_size):
+              current_batch_size = min(batch_size, num - i)
+              result = self._process_and_save_questions(topic, gemini_api_key, output_file, num_questions = current_batch_size, start_number = question_number)
+              if "error" in result:
+                    print(f"Error: {result['error']}")
+                    exit()
+
+              # Load generated questions and concatenate
+              try:
+                with open(output_file, 'r') as f:
+                  batch_questions = json.load(f)
+                  all_questions.extend(batch_questions)
+                  question_number += len(batch_questions)
+              except (FileNotFoundError, json.JSONDecodeError) as e:
+                  logging.error(f"Error reading or decoding generated JSON file : {e}")
+                  print(f"Error reading or decoding generated JSON file : {e}")
+                  exit()
+
+            # Save all generated questions to one file
+            with open (output_file, 'w') as f:
+              json.dump(all_questions, f, indent=4)
+              print(f"All {num} questions with images saved to {output_file}")
+
+      except Exception as e:
+        print(f"Error in generating visual question : {e}")
+        
+    def _strip_code(self, response_text):
+        response_text = response_text.strip()
+        if response_text.startswith('```json') and response_text.endswith('```'):
+            return response_text[7:-3].strip()
+        return response_text
+
+    def _generate_visual_questions(self, topic, gemini_api_key, num_questions=5):
+        gemini_flash = self.llm #ChatGoogleGenerativeAI(
+            #model="gemini-2.0-flash-exp",
+            #google_api_key=gemini_api_key,
+            #temperature=0.7,
+            #max_output_tokens=8192
+        #)
+
+        prompt = f"""
+            Generate exactly {num_questions} quantitative questions based on the topic: {topic}.
+            Each question should require a visual representation of the data (bar graph, pie chart, line graph, or scatter plot) along with a detailed instruction on how to create that visual and options for the question. The question should be solvable based on the data in the visual.
+
+            The visual type should be chosen based on the topic. 
+            Here is the general guidance for the visualization type:
+            - Use pie chart when visualizing proportions or parts of a whole.
+            - Use bar or column chart for comparing discrete categories or for displaying the frequency distribution.
+            - Use line graph for displaying changes over time or continuous data or relationship between two continuous variables.
+            - Use scatter plot for showing the relationship between two continuous variables, to identify any patterns and cluster of data.
+
+            The graph instruction MUST have the following structure in JSON format, selecting the relevant keys based on the visual type:
+            {{
+                "type": "bar" or "pie" or "line" or "scatter",
+                "x_labels": ["label 1", "label 2", "label 3", "label 4"] for bar or line graphs,
+                "x_values": [value 1, value 2, value 3, value 4] for scatter plot,
+                "y_values": [value 1, value 2, value 3, value 4] for bar or line graphs,
+                "labels": ["label 1", "label 2", "label 3", "label 4"] for pie chart,
+                "sizes": [value 1, value 2, value 3, value 4] for pie chart,
+                "y_label": "label for the y axis" for bar, line, scatter,
+                "title": "title of the graph or table",
+                "labels" : [ "label 1", "label 2", "label 3" ] for multiple lines in line graphs
+            }}
+
+           The values in x_values, y_values and sizes should be numerical.
+           The labels key should be used for multiple lines in line chart.
+
+            Output the response in JSON format with the following structure:
+            {{
+              "questions" : [
+                {{
+                    "question_text": "question text",
+                    "options": ["option a","option b", "option c", "option d"],
+                    "graph_instruction": {{"type": "bar" or "pie" or "line" or "scatter", ...}},
+                    "correct_answer": "Correct answer of the question"
+                }},
+                  {{
+                    "question_text": "question text",
+                    "options": ["option a","option b", "option c", "option d"],
+                    "graph_instruction": {{"type": "bar" or "pie" or "line" or "scatter", ...}},
+                    "correct_answer": "Correct answer of the question"
+                }}
+               ]
+            }}
+        """
+
+        response = gemini_flash.invoke(prompt)
+
+        if response and response.content:
+            json_output = self._strip_code(response.content)
+            logging.debug(f"Raw JSON output after stripping: {json_output}")
+            try:
+                return json.loads(json_output)
+            except json.JSONDecodeError as e:
+                logging.error(f"JSONDecodeError: {e}")
+                logging.error(f"Invalid JSON received: {json_output}")
+                return {"error": f"Invalid JSON format in Gemini response: {e}"}
+        else:
+            logging.error("Empty response received from Gemini.")
+            return {"error": "Empty response received from Gemini."}
+
+
+    # Function to process multiple questions and add images
+    def _process_and_save_questions(self,topic, gemini_api_key, output_file="question_data.json", num_questions=5, start_number = 1):
+      try:
+            question_data = self._generate_visual_questions(topic, gemini_api_key, num_questions)
+            if "error" in question_data:
+                return {"error": question_data["error"]}
+
+            processed_questions = []
+            # Add question numbers and generate images
+            for idx, question in enumerate(question_data["questions"], start=start_number):
+                question["question_number"] = idx
+                img_base64 = self._generate_and_save_visual(
+                    question["graph_instruction"],
+                    question["question_text"],
+                    question["options"],
+                    question["correct_answer"]
+                )
+                if img_base64:
+                    question["image_base64"] = img_base64
+                processed_questions.append(question)
+
+
+            # Save to json file
+            with open(output_file, 'w') as f:
+                json.dump(processed_questions, f, indent=4)
+            logging.info(f"Saved questions with images to file: {output_file}")
+            return {"message": f"Questions with images saved to {output_file}"}
+
+      except Exception as e:
+            logging.error(f"Error processing multiple question: {e}")
+            return {"error": f"Error processing multiple questions: {e}"}
+
+    # Function to generate visualizations based on instructions and save as base64
+    def _generate_and_save_visual(self, instruction, question_text, options, correct_answer):
+        try:
+            plt.figure(figsize=(10, 8))  # Set a large figure size for readability
+            img_buffer = BytesIO()
+
+            if instruction["type"] == "bar":
+                plt.bar(instruction["x_labels"], instruction["y_values"], color="skyblue")
+                plt.xlabel("Categories", fontsize=12)
+                plt.ylabel(instruction["y_label"], fontsize=12)
+                plt.title(instruction["title"], fontsize=14)
+                plt.grid(axis="y", linestyle="--", alpha=0.7)
+                plt.tight_layout()
+                plt.savefig(img_buffer, format="png")
+
+            elif instruction["type"] == "line":
+                if isinstance(instruction.get("y_values",[])[0], list):
+                    # Handle multiple lines
+                    for i, y_vals in enumerate(instruction["y_values"]):
+                        plt.plot(instruction["x_labels"], y_vals, marker="o", linestyle="-", label = instruction.get("labels",[f'line {i+1}'])[i])
+                else:
+                    plt.plot(instruction["x_labels"], instruction["y_values"], marker="o", linestyle="-", color="b")
+
+                plt.xlabel("X-axis", fontsize=12)
+                plt.ylabel(instruction["y_label"], fontsize=12)
+                plt.title(instruction["title"], fontsize=14)
+                plt.grid(axis="y", linestyle="--", alpha=0.7)
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(img_buffer, format="png")
+
+
+            elif instruction["type"] == "pie":
+                plt.pie(
+                    instruction["sizes"],
+                    labels=instruction["labels"],
+                    autopct="%1.1f%%",
+                    startangle=90,
+                    colors=plt.cm.Paired.colors
+                )
+                plt.title(instruction["title"], fontsize=14)
+                plt.tight_layout()
+                plt.savefig(img_buffer, format="png")
+
+            elif instruction["type"] == "scatter":
+                plt.scatter(instruction["x_values"], instruction["y_values"], color="r", alpha=0.7)
+                plt.xlabel("X-axis", fontsize=12)
+                plt.ylabel(instruction["y_label"], fontsize=12)
+                plt.title(instruction["title"], fontsize=14)
+                plt.grid(axis="both", linestyle="--", alpha=0.7)
+                plt.tight_layout()
+                plt.savefig(img_buffer, format="png")
+
+            elif instruction["type"] == "table":
+                df = pd.DataFrame(instruction["data"])
+                img_buffer = BytesIO()
+                import dataframe_image as dfi
+                dfi.export(df, img_buffer, table_conversion="matplotlib")
+                #dfi.export(df, "table.png", table_conversion="matplotlib")
+
+            plt.close()
+            img_buffer.seek(0)
+            img_base64 = base64.b64encode(img_buffer.read()).decode('utf-8')
+
+            # Display the image in the console using HTML (for Colab)
+            if instruction["type"] != "table":
+                display(HTML(f'<img src="data:image/png;base64,{img_base64}" style="max-width:500px; max-height:400px;">'))
+            else:
+                display(HTML(f'<img src="data:image/png;base64,{img_base64}" style="max-width:500px;">'))
+
+
+            # Display the question, options, and correct answer
+            print("\nQuestion:", question_text)
+            for idx, option in enumerate(options, start=1):
+                print(f"{chr(64+idx)}. {option}")
+            print("Correct Answer:", correct_answer)
+            print("-" * 80)
+
+            return img_base64
+
+        except Exception as e:
+            print(f"Error generating visualization: {e}")
+            return None
