@@ -20,7 +20,7 @@ from educhain.models.qna_models import (
     FillInBlankQuestionList, MCQListMath, Option ,SolvedDoubt, SpeechInstructions,
     VisualMCQList, VisualMCQ
 )
-from educhain.engines import VISUAL_QUESTION_PROMPT_TEMPLATE
+from educhain.engines.visualisation import VISUAL_QUESTION_PROMPT_TEMPLATE
 from educhain.utils.loaders import PdfFileLoader, UrlLoader
 from educhain.utils.output_formatter import OutputFormatter
 import base64
