@@ -1,102 +1,22 @@
-# educhain/engines/qna_engine.py
-
-from typing import Optional, Type, Any, List, Literal, Union, Tuple
+from typing import Optional, Type, Any, Literal
 from pydantic import BaseModel
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain, RetrievalQA, LLMMathChain
 from langchain.output_parsers import PydanticOutputParser
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Chroma
-from langchain_community.callbacks.manager import get_openai_callback
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.formatters import TextFormatter
-import re
-from langchain_core.messages import SystemMessage
-from langchain.schema import HumanMessage
 from educhain.core.config import LLMConfig
 from educhain.models.qna_models import (
-    MCQList, ShortAnswerQuestionList, TrueFalseQuestionList,
-    FillInBlankQuestionList, MCQListMath, Option ,SolvedDoubt, SpeechInstructions,
-    VisualMCQList, VisualMCQ
+    MCQList, ShortAnswerQuestionList, TrueFalseQuestionList, FillInBlankQuestionList,
+    SanityCheckSummary, SanityCheckResult,
+    MultipleChoiceQuestion, ShortAnswerQuestion, TrueFalseQuestion, FillInBlankQuestion
 )
-from educhain.utils.loaders import PdfFileLoader, UrlLoader
-from educhain.utils.output_formatter import OutputFormatter
-import base64
-import os
-from PIL import Image
-import io
-
-import matplotlib.pyplot as plt
-import pandas as pd
-import dataframe_image as dfi
-from IPython.display import display, HTML
-
-
-import random
 
 QuestionType = Literal["Multiple Choice", "Short Answer", "True/False", "Fill in the Blank"]
-OutputFormatType = Literal["pdf", "csv"]
-
-VISUAL_QUESTION_PROMPT_TEMPLATE = """Generate exactly {num} quantitative questions based on the topic: {topic}.
-        Each question should require a visual representation of the data (bar graph, pie chart, line graph, or scatter plot or table) along with a detailed instruction on how to create that visual and options for the question. The question should be solvable based on the data in the visual.
-
-        The visual type should be chosen based on the topic.
-        Here is the general guidance for the visualization type:
-        - Use pie chart when visualizing proportions or parts of a whole.
-        - Use bar or column chart for comparing discrete categories or for displaying the frequency distribution.
-        - Use line graph for displaying changes over time or continuous data or relationship between two continuous variables.
-        - Use scatter plot for showing the relationship between two continuous variables, to identify any patterns and cluster of data.
-        - Use table when presenting exact numerical data in organized rows and columns.
-
-        The graph instruction MUST have the following structure in JSON format, selecting the relevant keys based on the visual type:
-        {{
-            "type": "bar" or "pie" or "line" or "scatter" or "table",
-            "x_labels": ["label 1", "label 2", "label 3", "label 4"] for bar or line graphs,
-            "x_values": [value 1, value 2, value 3, value 4] for scatter plot,
-            "y_values": [value 1, value 2, value 3, value 4] for bar or line graphs,
-            "labels": ["label 1", "label 2", "label 3", "label 4"] for pie chart,
-            "sizes": [value 1, value 2, value 3, value 4] for pie chart,
-            "y_label": "label for the y axis" for bar, line, scatter,
-            "title": "title of the graph or table",
-           "labels" : [ "label 1", "label 2", "label 3" ] for multiple lines in line graphs,
-           "data": [
-                    {{ "column1": "value1", "column2": "value2", ... }},
-                    {{ "column1": "value3", "column2": "value4", ... }},
-                    ...
-                   ] for table
-        }}
-
-        Output the response in JSON format with the following structure:
-        {{
-          "questions" : [
-            {{
-                "question": "question text",
-                "options": ["option a","option b", "option c", "option d"],
-                "graph_instruction": {{"type": "bar" or "pie" or "line" or "scatter" or "table", ...}},
-                "answer": "Correct answer of the question",
-                "explanation": "Explanation of the question"
-            }},
-              {{
-                "question": "question text",
-                "options": ["option a","option b", "option c", "option d"],
-                "graph_instruction": {{"type": "bar" or "pie" or "line" or "scatter" or "table", ...}},
-                "answer": "Correct answer of the question",
-                "explanation": "Explanation of the question"
-            }}
-           ]
-        }}
-"""
-
 
 class QnAEngine:
     def __init__(self, llm_config: Optional[LLMConfig] = None):
         if llm_config is None:
             llm_config = LLMConfig()
         self.llm = self._initialize_llm(llm_config)
-        self.pdf_loader = PdfFileLoader()
-        self.url_loader = UrlLoader()
-        self.embeddings = None
 
     def _initialize_llm(self, llm_config: LLMConfig):
         if llm_config.custom_model:
@@ -111,230 +31,23 @@ class QnAEngine:
                 default_headers=llm_config.default_headers
             )
 
-    def _get_parser_and_model(self, question_type: QuestionType, response_model: Optional[Type[Any]] = None):
-        if response_model:
-            return PydanticOutputParser(pydantic_object=response_model), response_model
-        if question_type == "Multiple Choice":
-            return PydanticOutputParser(pydantic_object=MCQList), MCQList
-        elif question_type == "Short Answer":
-            return PydanticOutputParser(pydantic_object=ShortAnswerQuestionList), ShortAnswerQuestionList
-        elif question_type == "True/False":
-            return PydanticOutputParser(pydantic_object=TrueFalseQuestionList), TrueFalseQuestionList
-        elif question_type == "Fill in the Blank":
-            return PydanticOutputParser(pydantic_object=FillInBlankQuestionList), FillInBlankQuestionList
-        elif response_model == VisualMCQList:
-            return PydanticOutputParser(pydantic_object=VisualMCQList), VisualMCQList
-        else:
-            raise ValueError(f"Unsupported question type or response model: {question_type}, {response_model}")
+    def _get_response_model(self, question_type: QuestionType):
+        models = {
+            "Multiple Choice": MCQList,
+            "Short Answer": ShortAnswerQuestionList,
+            "True/False": TrueFalseQuestionList,
+            "Fill in the Blank": FillInBlankQuestionList
+        }
+        return models.get(question_type, MCQList)
 
-
-    def _get_prompt_template(self, question_type: QuestionType, custom_template: Optional[str] = None):
-        if custom_template == "graph":
-            return VISUAL_QUESTION_PROMPT_TEMPLATE
-        elif custom_template:
-            return custom_template
-        else:
-            base_template = f"""
-            Generate {{num}} {question_type} question(s) based on the given topic.
-            Topic: {{topic}}
-
-            For each question, provide:
-            1. The question
-            2. The correct answer
-            3. An explanation (optional)
-            """
-
-            if question_type == "Multiple Choice":
-                base_template += "\n4. A list of options (including the correct answer)"
-            elif question_type == "Short Answer":
-                base_template += "\n4. A list of relevant keywords"
-            elif question_type == "True/False":
-                base_template += "\n4. The correct answer as a boolean (true/false)"
-            elif question_type == "Fill in the Blank":
-                base_template += "\n4. The word or phrase to be filled in the blank"
-
-            return base_template
-
-
-    def _create_vector_store(self, content: str) -> Chroma:
-        if self.embeddings is None:
-            self.embeddings = OpenAIEmbeddings()
-
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
-        texts = text_splitter.split_text(content)
-
-        vectorstore = Chroma.from_texts(texts, self.embeddings)
-
-        return vectorstore
-
-    def _setup_retrieval_qa(self, vector_store: Chroma) -> RetrievalQA:
-        return RetrievalQA.from_chain_type(
-            llm=self.llm,
-            chain_type="stuff",
-            retriever=vector_store.as_retriever(),
-        )
-
-    def _load_data(self, source: str, source_type: str) -> str:
-        if source_type == 'pdf':
-            return self.pdf_loader.load_data(source)
-        elif source_type == 'url':
-            return self.url_loader.load_data(source)
-        elif source_type == 'text':
-            return source
-        else:
-            raise ValueError("Unsupported source type. Please use 'pdf', 'url', or 'text'.")
-
-    def _handle_output_format(self, data: Any, output_format: Optional[OutputFormatType]) -> Union[Any, Tuple[Any, str]]:
-        if output_format is None:
-            return data
-
-        formatter = OutputFormatter()
-        if output_format == "pdf":
-            output_file = formatter.to_pdf(data)
-        elif output_format == "csv":
-            output_file = formatter.to_csv(data)
-        else:
-            raise ValueError(f"Unsupported output format: {output_format}")
-
-        return data, output_file
-
-
-    def _generate_and_save_visual(self, instruction, question_text, options, correct_answer):
-        try:
-            plt.figure(figsize=(10, 8))
-            img_buffer = io.BytesIO()
-
-            if instruction["type"] == "bar":
-                plt.bar(instruction["x_labels"], instruction["y_values"], color="skyblue")
-                plt.xlabel("Categories", fontsize=12)
-                plt.ylabel(instruction["y_label"], fontsize=12)
-                plt.title(instruction["title"], fontsize=14)
-                plt.grid(axis="y", linestyle="--", alpha=0.7)
-                plt.tight_layout()
-                plt.savefig(img_buffer, format="png")
-
-            elif instruction["type"] == "line":
-                if isinstance(instruction["y_values"][0], list):
-                    for i, y_vals in enumerate(instruction["y_values"]):
-                        plt.plot(instruction["x_labels"], y_vals, marker="o", linestyle="-", label=instruction["labels"][i])
-                else:
-                    plt.plot(instruction["x_labels"], instruction["y_values"], marker="o", linestyle="-", color="b")
-
-                plt.xlabel("X-axis", fontsize=12)
-                plt.ylabel(instruction["y_label"], fontsize=12)
-                plt.title(instruction["title"], fontsize=14)
-                plt.grid(axis="y", linestyle="--", alpha=0.7)
-                plt.legend()
-                plt.tight_layout()
-                plt.savefig(img_buffer, format="png")
-
-            elif instruction["type"] == "pie":
-                plt.pie(
-                    instruction["sizes"],
-                    labels=instruction["labels"],
-                    autopct="%1.1f%%",
-                    startangle=90,
-                    colors=plt.cm.Paired.colors
-                )
-                plt.title(instruction["title"], fontsize=14)
-                plt.tight_layout()
-                plt.savefig(img_buffer, format="png")
-
-            elif instruction["type"] == "scatter":
-                plt.scatter(instruction["x_values"], instruction["y_values"], color="r", alpha=0.7)
-                plt.xlabel("X-axis", fontsize=12)
-                plt.ylabel(instruction["y_label"], fontsize=12)
-                plt.title(instruction["title"], fontsize=14)
-                plt.grid(axis="both", linestyle="--", alpha=0.7)
-                plt.tight_layout()
-                plt.savefig(img_buffer, format="png")
-
-            elif instruction["type"] == "table":
-                df = pd.DataFrame(instruction["data"])
-                img_buffer = io.BytesIO()
-                dfi.export(df, img_buffer, table_conversion="matplotlib")
-
-            plt.close()
-            img_buffer.seek(0)
-            img_base64 = base64.b64encode(img_buffer.read()).decode('utf-8')
-
-            if instruction["type"] != "table":
-                display(HTML(f'<img src="data:image/png;base64,{img_base64}" style="max-width:500px; max-height:400px;">'))
-            else:
-                display(HTML(f'<img src="data:image/png;base64,{img_base64}" style="max-width:500px;">'))
-
-            print("\nQuestion:", question_text)
-            for idx, option in enumerate(options, start=1):
-                print(f"{chr(64 + idx)}. {option}")
-            print("Correct Answer:", correct_answer)
-            print("-" * 80)
-
-            return img_base64
-
-        except Exception as e:
-            print(f"Error generating visualization: {e}")
-            return None
-
-
-    def _display_visual_questions(self, ques: VisualMCQList):
-        if ques and ques.questions:
-            for q_data in ques.questions:
-                instruction = q_data.graph_instruction
-                question_text = q_data.question
-                options = q_data.options
-                correct_answer = q_data.answer
-
-                self._generate_and_save_visual(instruction.dict(), question_text, options, correct_answer)
-                print(q_data)
-        else:
-            print("Failed to generate visual questions or no questions were returned.")
-
-
-    def generate_visual_questions(
-        self,
-        topic: str,
-        num: int = 1,
-        custom_instructions: Optional[str] = None,
-        output_format: Optional[OutputFormatType] = None,
-        **kwargs
-    ) -> Optional[VisualMCQList]:
-        parser, model = self._get_parser_and_model("Multiple Choice", VisualMCQList)
-        format_instructions = parser.get_format_instructions()
-        template = self._get_prompt_template("Multiple Choice", "graph")
-
-        if custom_instructions:
-            template += f"\n\nAdditional Instructions:\n{custom_instructions}"
-
-        template += "\n\nThe response should be in JSON format.\n{format_instructions}"
-
-        question_prompt = PromptTemplate(
-            input_variables=["num", "topic"],
-            template=template,
-            partial_variables={"format_instructions": format_instructions}
-        )
-
-        question_chain = question_prompt | self.llm
-        results = question_chain.invoke(
-            {"num": num, "topic": topic, **kwargs},
-        )
-        results = results.content
-
-        try:
-            structured_output = parser.parse(results)
-
-            if output_format:
-                self._handle_output_format(structured_output, output_format)
-
-            if isinstance(structured_output, VisualMCQList):
-                self._display_visual_questions(structured_output)
-
-            return structured_output
-        except Exception as e:
-            print(f"Error parsing output in generate_visual_questions: {e}")
-            print("Raw output:")
-            print(results)
-            return None
-
+    def _get_single_response_model(self, question_type: QuestionType):
+        models = {
+            "Multiple Choice": MultipleChoiceQuestion,
+            "Short Answer": ShortAnswerQuestion,
+            "True/False": TrueFalseQuestion,
+            "Fill in the Blank": FillInBlankQuestion
+        }
+        return models.get(question_type, MultipleChoiceQuestion)
 
     def generate_questions(
         self,
@@ -344,473 +57,290 @@ class QnAEngine:
         prompt_template: Optional[str] = None,
         custom_instructions: Optional[str] = None,
         response_model: Optional[Type[Any]] = None,
-        output_format: Optional[OutputFormatType] = None,
         **kwargs
     ) -> Any:
-        parser, model = self._get_parser_and_model(question_type, response_model)
+        response_model = response_model or self._get_response_model(question_type)
+        parser = PydanticOutputParser(pydantic_object=response_model)
         format_instructions = parser.get_format_instructions()
-        template = self._get_prompt_template(question_type, prompt_template)
+
+        if prompt_template is None:
+            prompt_template = """
+            Generate {num} {question_type} question(s) based on the given topic.
+            Topic: {topic}
+
+            For each question, provide:
+            1. The question
+            2. The correct answer
+            3. An explanation (optional)
+            {additional_fields}
+
+            Ensure the questions are clear, educational, and relevant to the topic.
+            """
+
+            additional_fields = {
+                "Multiple Choice": "4. A list of options (including the correct answer)",
+                "Short Answer": "4. A list of relevant keywords",
+                "True/False": "4. The correct answer as a boolean (true/false)",
+                "Fill in the Blank": "4. The word or phrase to be filled in the blank"
+            }.get(question_type, "")
+
+            prompt_template = prompt_template.replace("{additional_fields}", additional_fields)
 
         if custom_instructions:
-            template += f"\n\nAdditional Instructions:\n{custom_instructions}"
+            prompt_template += f"\n\nAdditional Instructions:\n{custom_instructions}"
 
-        template += "\n\nThe response should be in JSON format.\n{format_instructions}"
+        prompt_template += "\n\nThe response should be in JSON format.\n{format_instructions}"
 
         question_prompt = PromptTemplate(
-            input_variables=["num", "topic"],
-            template=template,
+            input_variables=["num", "topic", "question_type"],
+            template=prompt_template,
             partial_variables={"format_instructions": format_instructions}
         )
 
         question_chain = question_prompt | self.llm
-        results = question_chain.invoke(
-            {"num": num, "topic": topic, **kwargs},
-        )
+        results = question_chain.invoke({"num": num, "topic": topic, "question_type": question_type, **kwargs})
         results = results.content
 
         try:
             structured_output = parser.parse(results)
-
-            if output_format:
-                self._handle_output_format(structured_output, output_format)
-
-
             return structured_output
         except Exception as e:
             print(f"Error parsing output in generate_questions: {e}")
-            print("Raw output:")
-            return model()
+            print("Raw output:", results)
+            return response_model(questions=[])  # Return empty list on error
 
-
-    def generate_questions_from_data(
+    def _correct_question(
         self,
-        source: str,
-        source_type: str,
-        num: int,
-        question_type: QuestionType = "Multiple Choice",
-        prompt_template: Optional[str] = None,
-        custom_instructions: Optional[str] = None,
-        response_model: Optional[Type[Any]] = None,
-        output_format: Optional[OutputFormatType] = None,
-        **kwargs
+        failed_result: SanityCheckResult,
+        question_type: QuestionType,
+        topic: str,
+        llm: Optional[Any] = None
     ) -> Any:
-        content = self._load_data(source, source_type)
-        return self.generate_questions(
-            topic=content,
-            num=num,
-            question_type=question_type,
-            prompt_template=prompt_template,
-            custom_instructions=custom_instructions,
-            response_model=response_model,
-            output_format=output_format,
-            **kwargs
-        )
-
-    def generate_questions_with_rag(
-        self,
-        source: str,
-        source_type: str,
-        num: int,
-        question_type: QuestionType = "Multiple Choice",
-        prompt_template: Optional[str] = None,
-        custom_instructions: Optional[str] = None,
-        response_model: Optional[Type[Any]] = None,
-        learning_objective: str = "",
-        difficulty_level: str = "",
-        output_format: Optional[OutputFormatType] = None,
-        **kwargs
-    ) -> Any:
-        if self.embeddings is None:
-            self.embeddings = OpenAIEmbeddings()
-
-        content = self._load_data(source, source_type)
-
-        vector_store = self._create_vector_store(content)
-        qa_chain = self._setup_retrieval_qa(vector_store)
-
-        parser, model = self._get_parser_and_model(question_type, response_model)
+        """
+        Correct a failed question by passing it back to the LLM with failure feedback.
+        """
+        llm_to_use = llm if llm is not None else self.llm
+        response_model = self._get_single_response_model(question_type)
+        parser = PydanticOutputParser(pydantic_object=response_model)
         format_instructions = parser.get_format_instructions()
 
-        template = self._get_prompt_template(question_type, prompt_template)
+        prompt_template = """
+        The following {question_type} question failed a sanity check. Please revise it based on the feedback provided.
 
+        Original Question:
+        Question: {question}
+        Answer: {answer}
+        {additional_fields}
 
-        prompt_template += """
-        Learning Objective: {learning_objective}
-        Difficulty Level: {difficulty_level}
+        Sanity Check Feedback:
+        - Answer Correctness: {answer_correctness}
+        - Question Clarity: {question_clarity}
+        - Distractor Plausibility: {distractor_plausibility}
 
-        Ensure that the questions are relevant to the learning objective and match the specified difficulty level.
+        Topic: {topic}
 
-        The response should be in JSON format.
+        Revise the question to:
+        1. Ensure the answer is correct
+        2. Make the question clear and grammatically correct
+        3. {revision_guidance}
+        4. Provide an explanation if not already present
+
+        Output the revised question in JSON format:
         {format_instructions}
         """
 
-        if custom_instructions:
-            prompt_template += f"\n\nAdditional Instructions:\n{custom_instructions}"
+        additional_fields = ""
+        if failed_result.options:
+            additional_fields = f"Options:\n" + "\n".join(failed_result.options)
+        elif failed_result.keywords:
+            additional_fields = f"Keywords: {', '.join(failed_result.keywords)}"
 
-        question_prompt = PromptTemplate(
-            input_variables=["num", "topic", "learning_objective", "difficulty_level"],
+        revision_guidance = {
+            "Multiple Choice": "Ensure distractors are plausible but clearly wrong",
+            "Short Answer": "Ensure keywords are relevant and comprehensive",
+            "True/False": "Ensure the statement is unambiguous",
+            "Fill in the Blank": "Ensure the blank fits naturally and has a unique correct answer"
+        }.get(question_type, "")
+
+        prompt = PromptTemplate(
+            input_variables=["question", "answer", "additional_fields", "answer_correctness",
+                            "question_clarity", "distractor_plausibility", "topic", "question_type"],
             template=prompt_template,
-            partial_variables={"format_instructions": format_instructions}
+            partial_variables={"format_instructions": format_instructions, "revision_guidance": revision_guidance}
         )
 
-        query = question_prompt.format(
-            num=num,
-            topic=content[:1000],
-            learning_objective=learning_objective,
-            difficulty_level=difficulty_level,
-            **kwargs
-        )
-
-        results = qa_chain.invoke({"query": query, "n_results": 3})
+        correction_chain = prompt | llm_to_use
+        results = correction_chain.invoke({
+            "question": failed_result.question,
+            "answer": failed_result.answer,
+            "additional_fields": additional_fields,
+            "answer_correctness": failed_result.answer_correctness,
+            "question_clarity": failed_result.question_clarity,
+            "distractor_plausibility": failed_result.distractor_plausibility,
+            "topic": topic,
+            "question_type": question_type
+        })
+        results = results.content
 
         try:
-            structured_output = parser.parse(results["result"])
-
-            if output_format:
-                self._handle_output_format(structured_output, output_format)
-
-
-            return structured_output
+            corrected_question = parser.parse(results)
+            return corrected_question
         except Exception as e:
-            print(f"Error parsing output in generate_questions_with_rag: {e}")
+            print(f"Error parsing corrected question: {e}")
             print("Raw output:", results)
-            return model()
+            return None  # Return None if correction fails
 
-    def generate_similar_options(self, question, correct_answer, num_options=3):
-        llm = self.llm
-        prompt = f"Generate {num_options} incorrect but plausible options similar to this correct answer: {correct_answer} for this question: {question}. Provide only the options, separated by semicolons. The options should not precede or end with any symbols, it should be similar to the correct answer."
-        response = llm.predict(prompt)
-        return response.split(';')
-
-    def _process_math_result(self, math_result: Any) -> str:
-        if isinstance(math_result, dict):
-            if 'answer' in math_result:
-                return math_result['answer'].split('Answer: ')[-1].strip()
-            elif 'result' in math_result:
-                return math_result['result'].strip()
-
-        result_str = str(math_result)
-        if 'Answer:' in result_str:
-            return result_str.split('Answer:')[-1].strip()
-
-        lines = result_str.split('\n')
-        for line in reversed(lines):
-            if line.strip().replace('.', '').isdigit():
-                return line.strip()
-
-        raise ValueError("Could not extract numerical result from LLMMathChain response")
-
-    def generate_mcq_math(
+    def sanity_check(
         self,
-        topic: str,
-        num: int = 1,
-        question_type: QuestionType = "Multiple Choice",
-        prompt_template: Optional[str] = None,
+        question_list: Any,
+        topic: str = "Unknown Topic",  # Added to provide context for corrections
         custom_instructions: Optional[str] = None,
-        response_model: Optional[Type[Any]] = None,
-        **kwargs
-    ) -> Any:
-        if response_model is None:
-            parser = PydanticOutputParser(pydantic_object=MCQListMath)
-        else:
-            parser = PydanticOutputParser(pydantic_object=response_model)
+        auto_correct: bool = True,  # New parameter to toggle auto-correction
+        llm: Optional[Any] = None,
+    ) -> SanityCheckSummary:
+        """
+        Perform a sanity check on a list of questions with optional auto-correction.
 
+        Args:
+            question_list (Any): An instance of a question list (MCQList, ShortAnswerQuestionList, etc.).
+            topic (str): The topic of the questions, used for corrections.
+            custom_instructions (Optional[str]): Additional instructions for the sanity check.
+            auto_correct (bool): Whether to auto-correct failed questions (default: True).
+            llm (Optional[Any]): Custom LLM instance, defaults to engine's LLM.
+
+        Returns:
+            SanityCheckSummary: Summary of sanity check results with corrected questions if applicable.
+        """
+        if not hasattr(question_list, 'questions') or not question_list.questions:
+            raise ValueError("Input must be a valid question list with at least one question")
+
+        llm_to_use = llm if llm is not None else self.llm
+        parser = PydanticOutputParser(pydantic_object=SanityCheckSummary)
         format_instructions = parser.get_format_instructions()
 
-        template = self._get_prompt_template(question_type, prompt_template)
+        # Determine question type from the first question
+        question_type = type(question_list.questions[0]).__name__.replace("Question", "")
+        response_model = self._get_response_model(question_type)
 
+        # Prepare the questions for evaluation
+        questions_data = []
+        for q in question_list.questions:
+            options = getattr(q, 'options', None)
+            keywords = getattr(q, 'keywords', None)
+            answer = str(q.answer) if question_type == "TrueFalse" else q.answer
+            questions_data.append({
+                "type": question_type,
+                "question_text": q.question,
+                "answer_text": answer,
+                "options": options,
+                "keywords": keywords,
+                "original_question": q  # Store original for later replacement
+            })
 
+        # Define the sanity check prompt
         prompt_template = """
-            You are an Academic AI assistant specialized in generating multiple-choice math questions.
-            Generate {num} multiple-choice questions (MCQ) based on the given topic.
-            Each question MUST be a mathematical computation question.
+        Perform a sanity check on the following questions and answers.
+        For each question, evaluate:
+        1. Answer Correctness: Is the answer correct? Respond with 'Correct' or 'Incorrect'.
+        2. Question Clarity: Is the question clear and grammatically correct? Respond with 'Clear and Correct' or 'Needs Improvement'.
+        3. Distractor Plausibility (if applicable): For Multiple Choice, are distractors plausible but clearly wrong? Respond with 'Plausible Distractors' or 'Implausible Distractors'. For other types, respond with 'N/A'.
 
-            For each question:
-            1. Make sure it requires mathematical calculation
-            2. Set requires_math to true
-            3. Provide clear numerical values
-            4. Ensure the question has a single, unambiguous answer
+        Input questions:
+        {questions_input}
 
-            Topic: {topic}
+        {custom_instructions}
 
-            Format each question to include:
-            - A clear mathematical problem
-            - Four distinct numerical options
-            - The correct answer
-            - A step-by-step explanation
-            """
-
+        Output the response in JSON format with a list of results and a summary:
+        {format_instructions}
+        """
+        
         if custom_instructions:
-            prompt_template += f"\n\nAdditional Instructions:\n{custom_instructions}"
+            prompt_template = prompt_template.replace("{custom_instructions}", f"Additional Instructions:\n{custom_instructions}")
+        else:
+            prompt_template = prompt_template.replace("{custom_instructions}", "")
 
-        prompt_template += "\nThe response should be in JSON format.\n{format_instructions}"
+        # Format the questions input
+        questions_input = ""
+        for i, q in enumerate(questions_data, 1):
+            questions_input += f"\nQuestion {i} ({q['type']}):\n"
+            questions_input += f"Question: {q['question_text']}\n"
+            questions_input += f"Answer: {q['answer_text']}\n"
+            if q['options']:
+                options_str = "\n".join(q['options'])
+                questions_input += f"Options:\n{options_str}\n"
+            if q['keywords']:
+                keywords_str = ", ".join(q['keywords'])
+                questions_input += f"Keywords: {keywords_str}\n"
 
-        question_prompt = PromptTemplate(
-            input_variables=["num", "topic"],
+        prompt = PromptTemplate(
+            input_variables=["questions_input"],
             template=prompt_template,
             partial_variables={"format_instructions": format_instructions}
         )
 
-        question_chain = question_prompt | self.llm
-        results = question_chain.invoke(
-            {"num": num, "topic": topic, **kwargs},
-        )
+        # Generate the sanity check results
+        sanity_chain = prompt | llm_to_use
+        results = sanity_chain.invoke({"questions_input": questions_input})
         results = results.content
 
         try:
             structured_output = parser.parse(results)
-        except Exception as e:
-            print(f"Error parsing output: {e}")
-            print("Raw output:")
-            return MCQListMath()
-
-        llm_math = LLMMathChain.from_llm(llm=self.llm, verbose=True)
-
-        for question in structured_output.questions:
-            if question.requires_math:
-                try:
-                    math_result = llm_math.invoke({"question": question.question})
-
-                    try:
-                        solution = self._process_math_result(math_result)
-
-                        numerical_solution = float(solution)
-                        formatted_solution = f"{numerical_solution:.2f}"
-
-                        question.explanation += f"\n\nMath solution: {formatted_solution}"
-
-                        correct_option = Option(text=formatted_solution, correct='true')
-
-                        variations = [0.9, 1.1, 1.2]
-                        incorrect_options = []
-
-                        for var in variations:
-                            wrong_val = numerical_solution * var
-                            incorrect_options.append(
-                                Option(
-                                    text=f"{wrong_val:.2f}",
-                                    correct='false'
-                                )
-                            )
-
-                        question.options = [correct_option] + incorrect_options
-                        random.shuffle(question.options)
-
-                    except (ValueError, TypeError) as e:
-                        print(f"Error processing numerical result: {e}")
-                        raise
-
-                except Exception as e:
-                    print(f"LLMMathChain failed to answer: {str(e)}")
-                    question.explanation += "\n\nMath solution: Unable to compute."
-                    question.options = [
-                        Option(text="Unable to compute", correct='true'),
-                        Option(text="N/A", correct='false'),
-                        Option(text="N/A", correct='false'),
-                        Option(text="N/A", correct='false')
-                    ]
-
-        return structured_output
-
-    def _extract_video_id(self, url: str) -> str:
-        pattern = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?(?:embed\/)?(?:v\/)?(?:shorts\/)?(?:live\/)?(?:feature=player_embedded&v=)?(?:e\/)?(?:\/)?([^\s&amp;?#]+)'
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-        raise ValueError("Invalid YouTube URL")
-
-    def _get_youtube_transcript(self, video_id: str, target_language: str = 'en') -> tuple[str, str]:
-        try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-
-            available_languages = [transcript.language_code for transcript in transcript_list]
-
-            if not available_languages:
-                raise ValueError("No transcripts available for this video")
-
-            try:
-                transcript = transcript_list.find_transcript([target_language])
-                return TextFormatter().format_transcript(transcript.fetch()), target_language
-            except:
-                transcript = transcript_list.find_transcript(available_languages)
-                original_language = transcript.language_code
-
-                if transcript.is_translatable and target_language != original_language:
-                    translated = transcript.translate(target_language)
-                    return TextFormatter().format_transcript(translated.fetch()), target_language
-
-                return TextFormatter().format_transcript(transcript.fetch()), original_language
-
-        except Exception as e:
-            error_message = str(e).lower()
-            if "transcriptsdisabled" in error_message:
-                raise ValueError(
-                    "This video does not have subtitles/closed captions enabled. "
-                    "Available languages: " + ", ".join(available_languages)
-                )
-            elif "notranscriptfound" in error_message:
-                raise ValueError(
-                    f"No transcript found for language '{target_language}'. "
-                    f"Available languages: {', '.join(available_languages)}"
-                )
-            else:
-                raise ValueError(f"Error fetching transcript: {str(e)}")
-
-    def generate_questions_from_youtube(
-        self,
-        url: str,
-        num: int = 1,
-        question_type: QuestionType = "Multiple Choice",
-        prompt_template: Optional[str] = None,
-        custom_instructions: Optional[str] = None,
-        response_model: Optional[Type[Any]] = None,
-        output_format: Optional[OutputFormatType] = None,
-        target_language: str = 'en',
-        preserve_original_language: bool = False,
-        **kwargs
-    ) -> Any:
-        try:
-            video_id = self._extract_video_id(url)
-            transcript, detected_language = self._get_youtube_transcript(video_id, target_language)
-
-            if not transcript:
-                raise ValueError("No transcript content retrieved from the video")
-
-            language_context = f"\nContent language: {detected_language}"
-            if detected_language != target_language and not preserve_original_language:
-                language_context += f"\nGenerate questions in {target_language}"
-
-            video_context = f"\nThis content is from a YouTube video (ID: {video_id}). {language_context}"
-            if custom_instructions:
-                custom_instructions = video_context + "\n" + custom_instructions
-            else:
-                custom_instructions = video_context
-
-            return self.generate_questions_from_data(
-                source=transcript,
-                source_type="text",
-                num=num,
-                question_type=question_type,
-                prompt_template=prompt_template,
-                custom_instructions=custom_instructions,
-                response_model=response_model,
-                output_format=output_format,
-                target_language=target_language,
-                **kwargs
-            )
-
-        except ValueError as ve:
-            raise ValueError(f"YouTube processing error: {str(ve)}")
-        except Exception as e:
-            raise Exception(f"Unexpected error processing YouTube video: {str(e)}")
-
-    def _load_image(self, source: str) -> str:
-        try:
-            if source.startswith(('http://', 'https://')):
-                return source
-            elif source.startswith('data:image'):
-                return source
-            else:
-                image = Image.open(source)
-                if image.mode not in ('RGB', 'L'):
-                    image = image.convert('RGB')
-                
-                buffered = io.BytesIO()
-                image.save(buffered, format="JPEG")
-                return f"data:image/jpeg;base64,{base64.b64encode(buffered.getvalue()).decode()}"
-
-        except Exception as e:
-            raise ValueError(f"Error loading image: {str(e)}")
-
-    def solve_doubt(
-        self,
-        image_source: str,
-        prompt: str = "Explain how to solve this problem",
-        custom_instructions: Optional[str] = None,
-        detail_level: Literal["low", "medium", "high"] = "medium",
-        focus_areas: Optional[List[str]] = None,
-        **kwargs
-    ) -> SolvedDoubt:
-        """
-        Analyze an image and provide detailed explanation with solution steps.
-        
-        Args:
-            image_source: Path or URL to the image
-            prompt: Custom prompt for analysis
-            custom_instructions: Additional instructions for analysis
-            detail_level: Level of detail in explanation
-            focus_areas: Specific aspects to focus on
-            **kwargs: Additional parameters for the model
-        
-        Returns:
-            SolvedDoubt: Object containing explanation, steps, and additional notes
-        """
-        if not image_source:
-            raise ValueError("Image source (path or URL) is required")
-
-        try:
-            image_content = self._load_image(image_source)
             
-            # Create parser for structured output
-            parser = PydanticOutputParser(pydantic_object=SolvedDoubt)
-            format_instructions = parser.get_format_instructions()
-
-            # Construct the prompt with all parameters
-            base_prompt = f"Analyze the image and {prompt}\n"
-            if focus_areas:
-                base_prompt += f"\nFocus on these aspects: {', '.join(focus_areas)}"
-            base_prompt += f"\nProvide a {detail_level}-detail explanation"
-            
-            system_message = SystemMessage(
-                content="You are a helpful assistant that responds in Markdown. Help with math homework."
-            )
-
-            human_message_content = f"""
-            {base_prompt}
-            
-            Provide:
-            1. A detailed explanation
-            2. Step-by-step solution (if applicable)
-            3. Any additional notes or tips
-            
-            {custom_instructions or ''}
-            
-            {format_instructions}
-            """
-
-            human_message = HumanMessage(content=[
-                {"type": "text", "text": human_message_content},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_content,
-                        "detail": "high" if detail_level == "high" else "low"
-                    }
-                }
-            ])
-
-            response = self.llm.invoke(
-                [system_message, human_message],
-                **kwargs
-            )
-
-            try:
-                return parser.parse(response.content)
-            except Exception as e:
-                # Fallback if parsing fails
-                return SolvedDoubt(
-                    explanation=response.content,
-                    steps=[],
-                    additional_notes="Note: Response format was not structured as requested."
+            # Adjust results to include options/keywords and calculate pass/fail
+            for result, original_q in zip(structured_output.results, questions_data):
+                result.options = original_q["options"]
+                result.keywords = original_q["keywords"]
+                result.passed = (
+                    result.answer_correctness == "Correct" and
+                    result.question_clarity == "Clear and Correct" and
+                    (result.distractor_plausibility in ["Plausible Distractors", "N/A"])
                 )
 
-        except Exception as e:
-            error_msg = f"Error in solve_doubt: {type(e).__name__}: {str(e)}"
-            print(error_msg)
-            return SolvedDoubt(
-                explanation=error_msg,
-                steps=[],
-                additional_notes="An error occurred during processing."
-            )
+            # Auto-correct failed questions if enabled
+            if auto_correct:
+                corrected_questions = []
+                for i, (result, original_q) in enumerate(zip(structured_output.results, questions_data)):
+                    if not result.passed:
+                        print(f"Correcting failed question: {result.question}")
+                        corrected_q = self._correct_question(result, question_type, topic, llm_to_use)
+                        if corrected_q:
+                            corrected_questions.append(corrected_q)
+                        else:
+                            corrected_questions.append(original_q["original_question"])  # Keep original if correction fails
+                    else:
+                        corrected_questions.append(original_q["original_question"])
 
-   
+                # Update the question list with corrected questions
+                question_list.questions = corrected_questions
+
+                # Re-run sanity check on the updated list
+                print("Re-running sanity check on corrected questions...")
+                return self.sanity_check(question_list, topic, custom_instructions, auto_correct=False, llm=llm_to_use)
+
+            structured_output.total_questions = len(structured_output.results)
+            structured_output.passed_questions = sum(1 for r in structured_output.results if r.passed)
+            structured_output.failed_questions = structured_output.total_questions - structured_output.passed_questions
+            
+            return structured_output
+        except Exception as e:
+            print(f"Error parsing sanity check output: {e}")
+            print("Raw output:", results)
+            # Return a default summary on error
+            default_results = [
+                SanityCheckResult(
+                    question=q["question_text"],
+                    answer=q["answer_text"],
+                    options=q["options"],
+                    keywords=q["keywords"],
+                    answer_correctness="Unknown",
+                    question_clarity="Unknown",
+                    distractor_plausibility="Unknown",
+                    passed=False
+                ) for q in questions_data
+            ]
+            return SanityCheckSummary(
+                results=default_results,
+                total_questions=len(default_results),
+                passed_questions=0,
+                failed_questions=len(default_results)
+            )
