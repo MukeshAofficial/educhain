@@ -8,7 +8,7 @@ class Educhain:
         if config is None:
             config = LLMConfig()
         self.llm_config = config
-        self.qna_engine = QnAEngine(config)
+        self.qna_engine = QnAEngine(config)  # Updated QnAEngine with sanity_check
         self.content_engine = ContentEngine(config)
         self.components: Dict[str, Any] = {
             "qna_engine": self.qna_engine,
